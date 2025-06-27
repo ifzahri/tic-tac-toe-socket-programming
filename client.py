@@ -19,7 +19,7 @@ clock = pygame.time.Clock()
 FPS = 30 # Polling can be slower
 
 # Colors & Fonts
-WHITE, BLACK, BLUE, RED, GREEN, GRAY, LIGHT_GRAY = (255, 255, 255), (0, 0, 0), (0, 100, 200), (200, 0, 0), (0, 200, 0), (128, 128, 128), (200, 200, 200)
+WHITE, BLACK, BLUE, RED, GREEN, GRAY, LIGHT_GRAY, ORANGE = (255, 255, 255), (0, 0, 0), (0, 100, 200), (200, 0, 0), (0, 200, 0), (128, 128, 128), (200, 200, 200), (255, 165, 0)
 font_large, font_medium, font_small = pygame.font.Font(None, 72), pygame.font.Font(None, 36), pygame.font.Font(None, 24)
 
 class ClientInterface:
@@ -51,7 +51,6 @@ class ClientInterface:
                     if not chunk: break
                     response_data += chunk
 
-                # Handle cases where the response might not have a body
                 if b'\r\n\r\n' in response_data:
                     header_part, body_part = response_data.split(b'\r\n\r\n', 1)
                     if body_part:
@@ -70,6 +69,9 @@ class ClientInterface:
 
     def join_game(self, game_id):
         return self.send_request("POST", f"/game/join/{self.player_id}", {"game_id": game_id})
+    
+    def spectate_game(self, game_id):
+        return self.send_request("POST", f"/game/spectate/{self.player_id}", {"game_id": game_id})
 
     def make_move(self, row, col):
         return self.send_request("POST", f"/move/{self.player_id}", {"row": row, "col": col})
@@ -84,7 +86,6 @@ class ClientInterface:
         return self.send_request("GET", f"/history/{self.player_id}")
 
     def leave_game(self):
-        """Notifies the server that the player is leaving the current game."""
         return self.send_request("POST", f"/game/leave/{self.player_id}")
 
 
@@ -92,11 +93,11 @@ class TicTacToeGame:
     def __init__(self, player_id):
         self.player_id = player_id
         self.client = ClientInterface(player_id)
-        self.game_status = 'menu'  # menu, join_menu, waiting, playing, finished
+        self.game_status = 'menu'  # menu, lobby, waiting, playing, spectating, finished
         self.message = "Welcome to Tic Tac Toe!"
         self.board = [['.' for _ in range(3)] for _ in range(3)]
         self.winner, self.current_turn, self.your_symbol, self.players, self.symbols = None, None, None, [], {}
-        self.available_games, self.join_buttons = [], []
+        self.available_games, self.lobby_buttons = [], []
         self.game_history = []
         
         self.board_size = 450
@@ -104,7 +105,6 @@ class TicTacToeGame:
         self.board_start_y = 150
         self.cell_size = self.board_size // 3
         
-        # Register player
         result = self.client.register_player()
         self.message = result.get('message', 'Registration failed.')
 
@@ -127,25 +127,45 @@ class TicTacToeGame:
         pygame.draw.rect(screen, LIGHT_GRAY, history_btn)
         
         self.draw_text("Create Game", font_medium, WHITE, create_button.center)
-        self.draw_text("Join Game", font_medium, WHITE, join_button.center)
+        self.draw_text("Game Lobby", font_medium, WHITE, join_button.center)
         self.draw_text("Game History", font_medium, WHITE, history_btn.center)
-        self.draw_text(self.message, font_small, BLACK, (WIDTH//2, 400))
+        self.draw_text(self.message, font_small, BLACK, (WIDTH//2, 420))
         
         return create_button, join_button, history_btn
 
-    def draw_join_menu(self):
+    def draw_lobby_menu(self):
         screen.fill(WHITE)
-        self.draw_text("Available Games", font_large, BLACK, (WIDTH//2, 50))
+        self.draw_text("Game Lobby", font_large, BLACK, (WIDTH//2, 50))
         
-        self.join_buttons.clear()
+        self.lobby_buttons.clear()
         y_offset = 120
         for game in self.available_games:
-            game_text = f"Game {game['game_id']} (created by {game['created_by']})"
-            btn_rect = pygame.Rect(WIDTH//2 - 200, y_offset, 400, 40)
-            self.join_buttons.append((btn_rect, game['game_id']))
-            pygame.draw.rect(screen, LIGHT_GRAY, btn_rect)
-            self.draw_text(game_text, font_small, BLACK, btn_rect.center)
-            y_offset += 50
+            game_text = f"Game {game['game_id']} (by {game['created_by']})"
+            
+            # Action button (Join or Spectate)
+            action_text = ""
+            action_color = None
+            action_type = None
+
+            if game['status'] == 'waiting':
+                action_text = "Join"
+                action_color = GREEN
+                action_type = 'join'
+            elif game['status'] == 'playing':
+                action_text = "Spectate"
+                action_color = ORANGE
+                action_type = 'spectate'
+
+            if action_type:
+                game_rect = pygame.Rect(WIDTH//2 - 250, y_offset, 350, 40)
+                btn_rect = pygame.Rect(WIDTH//2 + 110, y_offset, 140, 40)
+                self.lobby_buttons.append((btn_rect, game['game_id'], action_type))
+
+                pygame.draw.rect(screen, LIGHT_GRAY, game_rect)
+                self.draw_text(game_text, font_small, BLACK, game_rect.center)
+                pygame.draw.rect(screen, action_color, btn_rect)
+                self.draw_text(action_text, font_small, WHITE, btn_rect.center)
+                y_offset += 50
         
         if not self.available_games:
             self.draw_text("No games available. Create one!", font_medium, RED, (WIDTH//2, 200))
@@ -158,23 +178,22 @@ class TicTacToeGame:
     def draw_history_menu(self):
         screen.fill(WHITE)
         self.draw_text("Your Game History", font_large, BLACK, (WIDTH//2, 50))
-        
         y_offset = 120
         if not self.game_history:
              self.draw_text("No games played yet.", font_medium, RED, (WIDTH//2, 200))
         else:
-            for entry in self.game_history:
-                winner = entry['winner']
-                outcome = "Victory" if winner == entry['symbols'].get(self.player_id) else "Defeat" if winner != 'draw' else "Draw"
+            for entry in self.game_history[-10:]: # Show last 10 games
+                winner = entry.get('winner')
+                player_symbol = entry.get('symbols', {}).get(self.player_id)
+                
+                outcome = "Victory" if winner == self.player_id else "Defeat" if winner not in ['draw', None] else "Draw"
                 color = GREEN if outcome == "Victory" else RED if outcome == "Defeat" else BLACK
                 
-                try:
-                    date = datetime.datetime.fromisoformat(entry['date']).strftime('%Y-%m-%d %H:%M')
-                except (ValueError, TypeError):
-                    date = "Unknown Date"
+                try: date = datetime.datetime.fromisoformat(entry['date']).strftime('%Y-%m-%d %H:%M')
+                except (ValueError, TypeError): date = "Unknown Date"
                     
                 other_players = ', '.join(p for p in entry['players'] if p != self.player_id)
-                if not other_players: other_players = "Yourself" # Handle games left early
+                if not other_players: other_players = "Yourself" 
                 text = f"{date} - Vs {other_players} - {outcome}"
                 
                 self.draw_text(text, font_small, color, (WIDTH//2, y_offset))
@@ -188,7 +207,10 @@ class TicTacToeGame:
 
     def draw_game(self):
         screen.fill(WHITE)
-        self.draw_text("Tic Tac Toe", font_medium, BLACK, (WIDTH//2, 30))
+        title = "Tic Tac Toe"
+        if self.game_status == 'spectating':
+            title = "Spectator Mode"
+        self.draw_text(title, font_medium, BLACK, (WIDTH//2, 30))
         
         if self.your_symbol:
             self.draw_text(f"You are: {self.your_symbol}", font_small, BLUE, (80, 70))
@@ -197,8 +219,9 @@ class TicTacToeGame:
             turn_msg = "YOUR TURN!" if self.current_turn == self.player_id else f"Turn: {self.current_turn}"
             color = GREEN if self.current_turn == self.player_id else BLACK
             self.draw_text(turn_msg, font_medium, color, (WIDTH//2, 100))
+        elif self.game_status == 'spectating' and self.current_turn:
+             self.draw_text(f"Turn: {self.current_turn}", font_medium, BLACK, (WIDTH//2, 100))
 
-        # Draw board and pieces
         for i in range(4):
             pygame.draw.line(screen, BLACK, (self.board_start_x + i * self.cell_size, self.board_start_y), (self.board_start_x + i * self.cell_size, self.board_start_y + self.board_size), 3)
             pygame.draw.line(screen, BLACK, (self.board_start_x, self.board_start_y + i * self.cell_size), (self.board_start_x + self.board_size, self.board_start_y + i * self.cell_size), 3)
@@ -216,9 +239,10 @@ class TicTacToeGame:
         status_msg = ""
         if self.game_status == 'waiting': status_msg = "Waiting for another player..."
         elif self.game_status == 'finished':
-            if self.winner == 'draw': status_msg = "Game ended in a draw!"
-            elif self.winner == self.your_symbol: status_msg = "You won!"
-            else: status_msg = f"Player with '{self.winner}' won!"
+            winner_id = self.winner
+            if winner_id == 'draw': status_msg = "Game ended in a draw!"
+            elif winner_id == self.player_id: status_msg = "You won!"
+            else: status_msg = f"Player '{winner_id}' won!"
         self.draw_text(status_msg, font_medium, BLACK, (WIDTH//2, status_y))
 
         if self.game_status == 'finished':
@@ -237,7 +261,6 @@ class TicTacToeGame:
                 if self.board[row][col] == '.':
                     result = self.client.make_move(row, col)
                     if result.get('status') == 'OK':
-                        # The server now returns the game state on a successful move
                         self.update_from_state(result.get('game_state', {}))
                     else:
                         self.message = result.get('message', 'Failed to make move.')
@@ -262,15 +285,23 @@ class TicTacToeGame:
         result = self.client.join_game(game_id)
         if result.get('status') == 'OK':
             self.game_status = 'playing'
-            self.update_game_state()
+            self.update_from_state(result.get('game_state', {}))
         else:
             self.message = result.get('message', 'Failed to join game.')
+            
+    def action_spectate_game(self, game_id):
+        result = self.client.spectate_game(game_id)
+        if result.get('status') == 'OK':
+            self.game_status = 'spectating'
+            self.update_from_state(result.get('game_state', {}))
+        else:
+            self.message = result.get('message', 'Failed to spectate game.')
 
     def action_fetch_games(self):
         result = self.client.get_available_games()
         if result.get('status') == 'OK':
             self.available_games = result.get('available_games', [])
-            self.game_status = 'join_menu'
+            self.game_status = 'lobby'
         else:
             self.message = result.get('message', "Can't fetch games.")
 
@@ -283,20 +314,17 @@ class TicTacToeGame:
             self.message = result.get('message', "Could not fetch game history.")
 
     def update_game_state(self):
-        # Only poll if we are in an active game
-        if self.game_status not in ['waiting', 'playing']:
+        if self.game_status not in ['waiting', 'playing', 'spectating']:
             return
         result = self.client.get_game_state()
         if result.get('status') == 'OK':
             self.update_from_state(result.get('game_state', {}))
         elif result.get("message") == "Player not in a game":
-            # This can happen if the server removed the game, move back to menu
             self.back_to_menu(notify_server=False)
 
 
     def back_to_menu(self, notify_server=True):
-        """Notifies server (optional) and resets local state."""
-        if notify_server:
+        if notify_server and self.game_status in ['waiting', 'playing', 'spectating', 'finished']:
             result = self.client.leave_game()
             self.message = result.get('message', "Welcome back!")
         else:
@@ -312,64 +340,56 @@ class TicTacToeGame:
         running = True
         update_counter = 0
 
-        # Button rects to be checked against mouse clicks in the event loop
-        create_btn_rect, join_btn_rect, history_btn = None, None, None
-        back_from_join_rect = None
-        back_from_game_rect = None
-        back_from_history_rect = None
+        create_btn, lobby_btn, history_btn = None, None, None
+        back_from_lobby_btn, back_from_game_btn, back_from_history_btn = None, None, None
 
         while running:
-            # --- 1. Event Handling ---
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
                 
                 if event.type == pygame.MOUSEBUTTONDOWN:
                     if self.game_status == 'menu':
-                        if create_btn_rect and create_btn_rect.collidepoint(event.pos):
-                            self.action_create_game()
-                        elif join_btn_rect and join_btn_rect.collidepoint(event.pos):
-                            self.action_fetch_games()
-                        elif history_btn and history_btn.collidepoint(event.pos):
-                            self.action_fetch_history()
+                        if create_btn and create_btn.collidepoint(event.pos): self.action_create_game()
+                        elif lobby_btn and lobby_btn.collidepoint(event.pos): self.action_fetch_games()
+                        elif history_btn and history_btn.collidepoint(event.pos): self.action_fetch_history()
                     
-                    elif self.game_status == 'join_menu':
-                        if back_from_join_rect and back_from_join_rect.collidepoint(event.pos):
-                            self.back_to_menu()
-                        for btn_rect, game_id in self.join_buttons:
+                    elif self.game_status == 'lobby':
+                        if back_from_lobby_btn and back_from_lobby_btn.collidepoint(event.pos): self.back_to_menu(notify_server=False)
+                        for btn_rect, game_id, action in self.lobby_buttons:
                             if btn_rect.collidepoint(event.pos):
-                                self.action_join_game(game_id)
+                                if action == 'join': self.action_join_game(game_id)
+                                elif action == 'spectate': self.action_spectate_game(game_id)
 
                     elif self.game_status == 'history_menu':
-                        if back_from_history_rect and back_from_history_rect.collidepoint(event.pos):
-                            self.back_to_menu()
+                        if back_from_history_btn and back_from_history_btn.collidepoint(event.pos): self.back_to_menu(notify_server=False)
                     
                     elif self.game_status == 'finished':
-                        if back_from_game_rect and back_from_game_rect.collidepoint(event.pos):
-                            self.back_to_menu()
+                        if back_from_game_btn and back_from_game_btn.collidepoint(event.pos): self.back_to_menu(notify_server=False)
                     
                     elif self.game_status == 'playing':
                         self.handle_click(event.pos)
 
-            # --- 2. Game Logic/State Updates (Polling) ---
             update_counter += 1
             if update_counter > (FPS * 1.5): # Poll every ~1.5 seconds
                 self.update_game_state()
                 update_counter = 0
 
-            # --- 3. Drawing ---
             if self.game_status == 'menu':
-                create_btn_rect, join_btn_rect, history_btn = self.draw_menu()
-            elif self.game_status == 'join_menu':
-                back_from_join_rect = self.draw_join_menu() # This also populates self.join_buttons
+                create_btn, lobby_btn, history_btn = self.draw_menu()
+            elif self.game_status == 'lobby':
+                back_from_lobby_btn = self.draw_lobby_menu()
             elif self.game_status == 'history_menu':
-                back_from_history_rect = self.draw_history_menu()
-            else: # Covers 'waiting', 'playing', 'finished'
-                back_from_game_rect = self.draw_game()
+                back_from_history_btn = self.draw_history_menu()
+            else: # Covers 'waiting', 'playing', 'spectating', 'finished'
+                back_from_game_btn = self.draw_game()
             
-            # --- 4. Update Display ---
             pygame.display.flip()
             clock.tick(FPS)
+            
+        # Notify server on window close if in an active game/session
+        if self.game_status != 'menu':
+            self.client.leave_game()
             
         pygame.quit()
         sys.exit()

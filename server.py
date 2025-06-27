@@ -18,7 +18,7 @@ class TicTacToeHttpServer:
         # Game state
         self.games = (
             {}
-        )  # game_id: {'board': [], 'players': [], 'current_turn': 0, 'status': 'waiting/playing/finished', 'winner': None}
+        )  # game_id: {'board': [], 'players': [], 'spectators': [], 'current_turn': 0, 'status': 'waiting/playing/finished', 'winner': None}
         self.players = {}  # player_id: {'game_id': None, 'symbol': 'X' or 'O'}
         self.game_history = {}
         self.next_game_id = 1
@@ -99,6 +99,11 @@ class TicTacToeHttpServer:
                 data = json.loads(body)
                 game_id = data.get("game_id")
                 result = self.join_game(player_id, game_id)
+            elif method == "POST" and path.startswith("/game/spectate/"):
+                player_id = path.split("/")[-1]
+                data = json.loads(body)
+                game_id = data.get("game_id")
+                result = self.spectate_game(player_id, game_id)
             elif method == "POST" and path.startswith("/move/"):
                 player_id = path.split("/")[-1]
                 data = json.loads(body)
@@ -147,6 +152,7 @@ class TicTacToeHttpServer:
         self.games[game_id] = {
             "board": [["." for _ in range(3)] for _ in range(3)],
             "players": [player_id],
+            "spectators": [],
             "current_turn_idx": 0,
             "status": "waiting",
             "winner": None,
@@ -179,11 +185,32 @@ class TicTacToeHttpServer:
             **self.get_game_state(player_id),
         }
 
+    def spectate_game(self, player_id, game_id):
+        if player_id not in self.players or self.players[player_id].get("game_id"):
+            return {"status": "ERROR", "message": "Player not registered or already in a game"}
+        if game_id not in self.games:
+            return {"status": "ERROR", "message": "Game does not exist"}
+        game = self.games[game_id]
+        if game['status'] not in ['playing', 'finished']:
+            return {"status": "ERROR", "message": "Game not available for spectating"}
+
+        game["spectators"].append(player_id)
+        self.players[player_id]["game_id"] = game_id
+        # Spectators have no symbol
+        self.players[player_id]["symbol"] = None
+
+        return {
+            "status": "OK",
+            "message": "Now spectating game",
+            **self.get_game_state(player_id),
+        }
+
+
     def get_available_games(self):
         available = [
-            {"game_id": gid, "created_by": g["players"][0]}
+            {"game_id": gid, "created_by": g["players"][0], "status": g["status"]}
             for gid, g in self.games.items()
-            if g["status"] == "waiting"
+            if g["status"] in ["waiting", "playing"]
         ]
         return {"status": "OK", "available_games": available}
 
@@ -230,8 +257,10 @@ class TicTacToeHttpServer:
         symbol = self.players[player_id]["symbol"]
         game["board"][row][col] = symbol
 
-        if self.check_winner(game["board"], symbol):
-            self._end_game_and_record_history(game_id, symbol, reason="win")
+        winner = self.check_winner(game["board"])
+        if winner:
+            winning_player_id = next((pid for pid, sym in game["symbols"].items() if sym == winner), None)
+            self._end_game_and_record_history(game_id, winning_player_id, reason="win")
         elif self.is_board_full(game["board"]):
             self._end_game_and_record_history(game_id, "draw", reason="draw")
         else:
@@ -243,40 +272,37 @@ class TicTacToeHttpServer:
             **self.get_game_state(player_id),
         }
 
-    def check_winner(self, board, symbol):
-        # Check rows, columns, and diagonals for the given symbol
-        for i in range(3):
-            if all(board[i][j] == symbol for j in range(3)):
-                return True
-            if all(board[j][i] == symbol for j in range(3)):
-                return True
-        if board[0][0] == board[1][1] == board[2][2] == symbol:
-            return True
-        if board[0][2] == board[1][1] == board[2][0] == symbol:
-            return True
-        return False
+    def check_winner(self, board):
+        for symbol in ["X", "O"]:
+            for i in range(3):
+                if all(board[i][j] == symbol for j in range(3)): return symbol
+                if all(board[j][i] == symbol for j in range(3)): return symbol
+            if board[0][0] == board[1][1] == board[2][2] == symbol: return symbol
+            if board[0][2] == board[1][1] == board[2][0] == symbol: return symbol
+        return None
 
     def is_board_full(self, board):
         return all(cell != "." for row in board for cell in row)
 
-    def _end_game_and_record_history(self, game_id, winner_symbol, reason="completed"):
+    def _end_game_and_record_history(self, game_id, winner_id, reason="completed"):
         game = self.games.get(game_id)
         if not game:
             return
 
         game["status"] = "finished"
-        game["winner"] = winner_symbol
+        game["winner"] = winner_id
 
         history_entry = {
             "game_id": game_id,
             "players": list(game["players"]),
-            "winner": winner_symbol,
+            "winner": winner_id,
             "date": datetime.utcnow().isoformat(),
             "symbols": dict(game["symbols"]),
             "reason": reason,
         }
-
-        for p_id in game["players"]:
+        
+        all_involved_players = game["players"] + game["spectators"]
+        for p_id in all_involved_players:
             if p_id not in self.game_history:
                 self.game_history[p_id] = []
             self.game_history[p_id].append(history_entry)
@@ -284,11 +310,11 @@ class TicTacToeHttpServer:
                 self.players[p_id]["game_id"] = None
                 self.players[p_id]["symbol"] = None
 
+
     def get_player_history(self, player_id):
         if player_id not in self.players:
             return {"status": "ERROR", "message": "Player not registered."}
 
-        # Add symbols to history entries for client-side display logic
         history_with_symbols = []
         for entry in self.game_history.get(player_id, []):
             game_id = entry["game_id"]
@@ -302,20 +328,24 @@ class TicTacToeHttpServer:
         if player_id not in self.players:
             return {"status": "ERROR", "message": "Invalid player ID."}
         game_id = self.players[player_id].get("game_id")
+        
         if game_id and game_id in self.games:
             game = self.games[game_id]
-            if game["status"] != "finished" and len(game["players"]) > 1:
-                other_player = next(
-                    (p for p in game["players"] if p != player_id), None
-                )
-                if other_player:
-                    winner_symbol = game["symbols"].get(other_player)
-                    self._end_game_and_record_history(
-                        game_id, winner_symbol, reason="disconnect"
-                    )
-            elif game["status"] == "waiting":
-                del self.games[game_id]
 
+            # If player is a spectator
+            if player_id in game["spectators"]:
+                game["spectators"].remove(player_id)
+            # If player is an active player
+            elif player_id in game["players"]:
+                if game["status"] != "finished" and len(game["players"]) > 1:
+                    other_player = next((p for p in game["players"] if p != player_id), None)
+                    if other_player:
+                        self._end_game_and_record_history(game_id, other_player, reason="disconnect")
+                elif game["status"] == "waiting":
+                    # If a waiting game is abandoned, remove it completely
+                    del self.games[game_id]
+
+        # Reset player's game state
         self.players[player_id]["game_id"] = None
         self.players[player_id]["symbol"] = None
         return {"status": "OK", "message": "You have left the game."}
