@@ -3,34 +3,91 @@ import threading
 import json
 import logging
 import uuid
-from datetime import datetime
-import hashlib
+from datetime import datetime, timedelta
+import time
+import os
 
 logging.basicConfig(level=logging.INFO)
 
 
 class TicTacToeHttpServer:
-    def __init__(self, host="localhost", port=55556):
+    def __init__(self, host="localhost", port=55556, state_file="game_state.json"):
         self.host = host
         self.port = port
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+        self.state_file = state_file
+        self.offline_threshold = timedelta(seconds=10)
+        self.timeout_threshold = timedelta(seconds=30)
+
         # Game state
-        self.games = (
-            {}
-        )  # game_id: {'board': [], 'players': [], 'spectators': [], 'current_turn': 0, 'status': 'waiting/playing/finished', 'winner': None, 'disconnected_players': []}
-        self.users = {}  # username: {'password_hash': '', 'game_id': None, 'symbol': 'X' or 'O', 'last_seen': None, 'connected': False}
+        self.games = {}
+        self.players = {}
         self.game_history = {}
-        self.load_users()
+        self.load_game_state()
 
         # Lock for thread-safe access to shared game state
         self.lock = threading.Lock()
+
+    def load_game_state(self):
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r") as f:
+                    state = json.load(f)
+                    self.games = state.get("games", {})
+                    self.players = state.get("players", {})
+                    # Convert string timestamps back to datetime objects
+                    for pid, pdata in self.players.items():
+                        if "last_seen" in pdata and isinstance(pdata["last_seen"], str):
+                            iso_date_str = pdata["last_seen"]
+                            if "." in iso_date_str:
+                                iso_date_str = iso_date_str.split(".")[0]
+                            pdata["last_seen"] = datetime.strptime(
+                                iso_date_str, "%Y-%m-%dT%H:%M:%S"
+                            )
+
+                        # Ensure all loaded players have a connection status
+                        if "connection_status" not in pdata:
+                            pdata["connection_status"] = "offline"
+
+                    self.game_history = state.get("game_history", {})
+                    logging.info("Game state loaded from file.")
+            except (json.JSONDecodeError, IOError, ValueError) as e:
+                logging.error(f"Could not load game state: {e}. Starting fresh.")
+                self.games = {}
+                self.players = {}
+                self.game_history = {}
+
+    def save_game_state(self):
+        players_copy = {}
+        for pid, pdata in self.players.items():
+            players_copy[pid] = pdata.copy()
+            if "last_seen" in players_copy[pid] and isinstance(
+                players_copy[pid]["last_seen"], datetime
+            ):
+                players_copy[pid]["last_seen"] = players_copy[pid][
+                    "last_seen"
+                ].isoformat()
+
+        state = {
+            "games": self.games,
+            "players": players_copy,
+            "game_history": self.game_history,
+        }
+        with open(self.state_file, "w") as f:
+            json.dump(state, f, indent=4)
+        logging.info("Game state saved.")
 
     def start_server(self):
         self.socket.bind((self.host, self.port))
         self.socket.listen(5)
         logging.info(f"Tic Tac Toe HTTP Server started on {self.host}:{self.port}")
+
+        # Start the thread to check for inactive players
+        reaper_thread = threading.Thread(target=self.reap_inactive_players)
+        reaper_thread.daemon = True
+        reaper_thread.start()
 
         while True:
             client_socket, address = self.socket.accept()
@@ -40,6 +97,41 @@ class TicTacToeHttpServer:
             )
             client_thread.daemon = True
             client_thread.start()
+
+    def reap_inactive_players(self):
+        while True:
+            time.sleep(5)  # Check every 5 seconds
+            now = datetime.utcnow()
+            with self.lock:
+                players_in_game = {
+                    pid: data
+                    for pid, data in self.players.items()
+                    if data.get("game_id")
+                }
+                state_changed = False
+
+                for player_id, data in list(players_in_game.items()):
+                    last_seen = data.get("last_seen", now)
+
+                    # If player has been inactive long enough to be timed out, remove them
+                    if now - last_seen > self.timeout_threshold:
+                        logging.info(
+                            f"Player {player_id} timed out completely. Removing from game."
+                        )
+                        self.leave_game(player_id)
+                        state_changed = True
+                    # If player is inactive but not yet timed out, mark as offline
+                    elif (
+                        now - last_seen > self.offline_threshold
+                        and data.get("connection_status") == "online"
+                    ):
+                        if player_id in self.players:
+                            logging.info(f"Player {player_id} marked as offline.")
+                            self.players[player_id]["connection_status"] = "offline"
+                            state_changed = True
+
+                if state_changed:
+                    self.save_game_state()
 
     def handle_request(self, client_socket):
         try:
@@ -57,6 +149,14 @@ class TicTacToeHttpServer:
             client_socket.sendall(response)
             client_socket.close()
 
+    def update_player_last_seen(self, player_id):
+        if player_id in self.players:
+            self.players[player_id]["last_seen"] = datetime.utcnow()
+            # If player was offline, mark them as online and save state
+            if self.players[player_id].get("connection_status") == "offline":
+                self.players[player_id]["connection_status"] = "online"
+                self.save_game_state()
+
     def process_request(self, request_data):
         lines = request_data.split("\r\n")
         request_line = lines[0]
@@ -72,6 +172,11 @@ class TicTacToeHttpServer:
 
         logging.info(f"Request: {method} {path}")
 
+        parts = path.strip("/").split("/")
+        player_id_from_path = None
+        if len(parts) > 1 and parts[0] in ["player", "game", "move", "history"]:
+            player_id_from_path = parts[-1]
+
         body = ""
         # Find the body by locating the double CRLF, which separates headers from the body.
         if "\r\n\r\n" in request_data:
@@ -79,48 +184,45 @@ class TicTacToeHttpServer:
 
         # Routing
         with self.lock:
+            if player_id_from_path and player_id_from_path in self.players:
+                self.update_player_last_seen(player_id_from_path)
+
             # Default result for unhandled paths
             result = self.create_response(
                 404, "Not Found", {"status": "ERROR", "message": "Endpoint not found"}
             )
 
-            if method == "POST" and path == "/register":
-                data = json.loads(body)
-                result = self.register_user(data.get('username'), data.get('password'))
-            elif method == "POST" and path == "/login":
-                data = json.loads(body)
-                result = self.login_user(data.get('username'), data.get('password'))
+            if method == "POST" and path.startswith("/player/"):
+                player_id = path.split("/")[-1]
+                result = self.register_player(player_id)
             elif method == "GET" and path == "/games":
                 result = self.get_available_games()
             elif method == "GET" and path.startswith("/history/"):
-                username = path.split("/")[-1]
-                result = self.get_player_history(username)
+                player_id = path.split("/")[-1]
+                result = self.get_player_history(player_id)
             elif method == "POST" and path.startswith("/game/create/"):
-                username = path.split("/")[-1]
-                result = self.create_game(username)
+                player_id = path.split("/")[-1]
+                result = self.create_game(player_id)
             elif method == "POST" and path.startswith("/game/join/"):
-                username = path.split("/")[-1]
+                player_id = path.split("/")[-1]
                 data = json.loads(body)
                 game_id = data.get("game_id")
-                result = self.join_game(username, game_id)
+                result = self.join_game(player_id, game_id)
             elif method == "POST" and path.startswith("/game/spectate/"):
-                username = path.split("/")[-1]
+                player_id = path.split("/")[-1]
                 data = json.loads(body)
                 game_id = data.get("game_id")
-                result = self.spectate_game(username, game_id)
+                result = self.spectate_game(player_id, game_id)
             elif method == "POST" and path.startswith("/move/"):
-                username = path.split("/")[-1]
+                player_id = path.split("/")[-1]
                 data = json.loads(body)
-                result = self.make_move(username, data["row"], data["col"])
+                result = self.make_move(player_id, data["row"], data["col"])
             elif method == "GET" and path.startswith("/game/state/"):
-                username = path.split("/")[-1]
-                result = self.get_game_state(username)
+                player_id = path.split("/")[-1]
+                result = self.get_game_state(player_id)
             elif method == "POST" and path.startswith("/game/leave/"):
-                username = path.split("/")[-1]
-                result = self.leave_game(username)
-            elif method == "POST" and path.startswith("/disconnect/"):
-                username = path.split("/")[-1]
-                result = self.disconnect_user(username)
+                player_id = path.split("/")[-1]
+                result = self.leave_game(player_id)
 
             # Check if result is a dictionary to be formatted as a response
             if isinstance(result, dict):
@@ -142,97 +244,48 @@ class TicTacToeHttpServer:
         response_str = "\r\n".join(headers)
         return response_str.encode("utf-8") + body_bytes
 
-    def _hash_password(self, password):
-        # Storing password in plain text as requested by user.
-        return password
+    def register_player(self, player_id):
+        if not player_id:
+            return {"status": "ERROR", "message": "Player ID required"}
+        if player_id not in self.players:
+            self.players[player_id] = {
+                "game_id": None,
+                "symbol": None,
+                "last_seen": datetime.utcnow(),
+                "connection_status": "online",
+            }
+        else:
+            self.players[player_id]["last_seen"] = datetime.utcnow()
+            self.players[player_id]["connection_status"] = "online"
+        self.save_game_state()
+        return {"status": "OK", "message": "Player registered", "player_id": player_id}
 
-    def save_users(self):
-        with open('users.json', 'w') as f:
-            json.dump(self.users, f, indent=4)
-
-    def load_users(self):
-        try:
-            with open('users.json', 'r') as f:
-                self.users = json.load(f)
-                logging.info("User data loaded.")
-        except (FileNotFoundError, json.JSONDecodeError):
-            logging.info("No user data found, starting fresh.")
-            self.users = {}
-
-    def register_user(self, username, password):
-        if not username or not password:
-            return {"status": "ERROR", "message": "Username and password are required"}
-        if username in self.users:
-            return {"status": "ERROR", "message": "Username already exists"}
-        
-        self.users[username] = {
-            "password": self._hash_password(password),
-            "game_id": None, 
-            "symbol": None, 
-            "last_seen": None, 
-            "connected": False
-        }
-        self.save_users()
-        return {"status": "OK", "message": "User registered successfully"}
-
-    def login_user(self, username, password):
-        if username not in self.users:
-            return {"status": "ERROR", "message": "Username not found"}
-        
-        user = self.users[username]
-        if user['password'] != self._hash_password(password):
-            return {"status": "ERROR", "message": "Invalid password"}
-        
-        if user.get('connected'):
-            return {"status": "ERROR", "message": "User is already logged in elsewhere"}
-
-        user['connected'] = True
-        user['last_seen'] = datetime.now().isoformat()
-        self.save_users()
-
-        game_id = user.get('game_id')
-        if game_id and game_id in self.games:
-            game = self.games[game_id]
-            if username in game.get('disconnected_players', []):
-                game['disconnected_players'].remove(username)
-                if not game['disconnected_players']:
-                    game['status'] = 'playing'
-                
-                return {
-                    "status": "OK",
-                    "message": "Reconnected to game.",
-                    "game_state": self.get_game_state(username).get('game_state')
-                }
-        
-        return {"status": "OK", "message": "Login successful. No active game found."}
-
-
-    def create_game(self, username):
-        if username not in self.users or self.users[username].get("game_id"):
+    def create_game(self, player_id):
+        if player_id not in self.players or self.players[player_id].get("game_id"):
             return {
                 "status": "ERROR",
-                "message": "User not registered or already in a game",
+                "message": "Player not registered or already in a game",
             }
         game_id = str(uuid.uuid4().hex[:4])
         self.games[game_id] = {
             "board": [["." for _ in range(3)] for _ in range(3)],
-            "players": [username],
+            "players": [player_id],
             "spectators": [],
             "current_turn_idx": 0,
             "status": "waiting",
             "winner": None,
-            "symbols": {username: "X"},
-            "disconnected_players": [],
+            "symbols": {player_id: "X"},
         }
-        self.users[username]["game_id"] = game_id
-        self.users[username]["symbol"] = "O" # Creator is now Circle
+        self.players[player_id]["game_id"] = game_id
+        self.players[player_id]["symbol"] = "X"
+        self.save_game_state()
         return {"status": "OK", "message": "Game created", "game_id": game_id}
 
-    def join_game(self, username, game_id):
-        if username not in self.users or self.users[username].get("game_id"):
+    def join_game(self, player_id, game_id):
+        if player_id not in self.players or self.players[player_id].get("game_id"):
             return {
                 "status": "ERROR",
-                "message": "User not registered or already in a game",
+                "message": "Player not registered or already in a game",
             }
         if game_id not in self.games or self.games[game_id]["status"] != "waiting":
             return {"status": "ERROR", "message": "Game not available for joining"}
@@ -240,35 +293,39 @@ class TicTacToeHttpServer:
         if len(game["players"]) >= 2:
             return {"status": "ERROR", "message": "Game is already full"}
 
-        game["players"].append(username)
+        game["players"].append(player_id)
         game["status"] = "playing"
-        game["symbols"][username] = "X" # Joiner is now Cross
-        self.users[username]["game_id"] = game_id
-        self.users[username]["symbol"] = "X"
+        game["symbols"][player_id] = "O"
+        self.players[player_id]["game_id"] = game_id
+        self.players[player_id]["symbol"] = "O"
+        self.save_game_state()
         return {
             "status": "OK",
             "message": "Joined game",
-            **self.get_game_state(username),
+            **self.get_game_state(player_id),
         }
 
-    def spectate_game(self, username, game_id):
-        if username not in self.users or self.users[username].get("game_id"):
-            return {"status": "ERROR", "message": "User not registered or already in a game"}
+    def spectate_game(self, player_id, game_id):
+        if player_id not in self.players or self.players[player_id].get("game_id"):
+            return {
+                "status": "ERROR",
+                "message": "Player not registered or already in a game",
+            }
         if game_id not in self.games:
             return {"status": "ERROR", "message": "Game does not exist"}
         game = self.games[game_id]
-        if game['status'] not in ['playing', 'finished']:
+        if game["status"] not in ["playing", "finished"]:
             return {"status": "ERROR", "message": "Game not available for spectating"}
 
-        game["spectators"].append(username)
-        self.users[username]["game_id"] = game_id
+        game["spectators"].append(player_id)
+        self.players[player_id]["game_id"] = game_id
         # Spectators have no symbol
-        self.users[username]["symbol"] = None
-
+        self.players[player_id]["symbol"] = None
+        self.save_game_state()
         return {
             "status": "OK",
             "message": "Now spectating game",
-            **self.get_game_state(username),
+            **self.get_game_state(player_id),
         }
 
 
@@ -280,18 +337,24 @@ class TicTacToeHttpServer:
         ]
         return {"status": "OK", "available_games": available}
 
-    def get_game_state(self, username):
-        if username not in self.users:
-            return {"status": "ERROR", "message": "Invalid username"}
-        game_id = self.users[username].get("game_id")
+    def get_game_state(self, player_id):
+        if player_id not in self.players:
+            return {"status": "ERROR", "message": "Invalid player ID"}
+        game_id = self.players[player_id].get("game_id")
         if not game_id or game_id not in self.games:
-            return {"status": "ERROR", "message": "User not in a game"}
+            return {"status": "ERROR", "message": "Player not in a game"}
         game = self.games[game_id]
         current_player = (
             game["players"][game["current_turn_idx"]]
-            if game["status"] == "playing"
+            if game["status"] == "playing" and game["players"]
             else None
         )
+
+        player_statuses = {
+            p_id: self.players.get(p_id, {}).get("connection_status", "offline")
+            for p_id in game["players"]
+        }
+
         return {
             "status": "OK",
             "game_state": {
@@ -299,53 +362,60 @@ class TicTacToeHttpServer:
                 "game_status": game["status"],
                 "current_turn": current_player,
                 "winner": game["winner"],
-                "your_symbol": self.users[username].get("symbol"),
+                "your_symbol": self.players[player_id].get("symbol"),
                 "players": game["players"],
                 "symbols": game["symbols"],
-                "disconnected_players": game.get("disconnected_players", []),
+                "player_statuses": player_statuses,
             },
         }
 
-    def make_move(self, username, row, col):
-        if username not in self.users:
-            return {"status": "ERROR", "message": "Invalid username"}
-        game_id = self.users[username].get("game_id")
+    def make_move(self, player_id, row, col):
+        if player_id not in self.players:
+            return {"status": "ERROR", "message": "Invalid player ID"}
+        game_id = self.players[player_id].get("game_id")
         if not game_id:
-            return {"status": "ERROR", "message": "User not in a game"}
+            return {"status": "ERROR", "message": "Player not in a game"}
 
         game = self.games[game_id]
         if game["status"] != "playing":
             return {"status": "ERROR", "message": "Game not in progress"}
-        if game["players"][game["current_turn_idx"]] != username:
+        if game["players"][game["current_turn_idx"]] != player_id:
             return {"status": "ERROR", "message": "Not your turn"}
         if not (0 <= row < 3 and 0 <= col < 3 and game["board"][row][col] == "."):
             return {"status": "ERROR", "message": "Invalid move"}
 
-        symbol = self.users[username]["symbol"]
+        symbol = self.players[player_id]["symbol"]
         game["board"][row][col] = symbol
 
         winner = self.check_winner(game["board"])
         if winner:
-            winning_username = next((uid for uid, sym in game["symbols"].items() if sym == winner), None)
-            self._end_game_and_record_history(game_id, winning_username, reason="win")
+            winning_player_id = next(
+                (pid for pid, sym in game["symbols"].items() if sym == winner), None
+            )
+            self._end_game_and_record_history(game_id, winning_player_id, reason="win")
         elif self.is_board_full(game["board"]):
             self._end_game_and_record_history(game_id, "draw", reason="draw")
         else:
             game["current_turn_idx"] = 1 - game["current_turn_idx"]
 
+        self.save_game_state()
         return {
             "status": "OK",
             "message": "Move made",
-            **self.get_game_state(username),
+            **self.get_game_state(player_id),
         }
 
     def check_winner(self, board):
         for symbol in ["X", "O"]:
             for i in range(3):
-                if all(board[i][j] == symbol for j in range(3)): return symbol
-                if all(board[j][i] == symbol for j in range(3)): return symbol
-            if board[0][0] == board[1][1] == board[2][2] == symbol: return symbol
-            if board[0][2] == board[1][1] == board[2][0] == symbol: return symbol
+                if all(board[i][j] == symbol for j in range(3)):
+                    return symbol
+                if all(board[j][i] == symbol for j in range(3)):
+                    return symbol
+            if board[0][0] == board[1][1] == board[2][2] == symbol:
+                return symbol
+            if board[0][2] == board[1][1] == board[2][0] == symbol:
+                return symbol
         return None
 
     def is_board_full(self, board):
@@ -353,7 +423,7 @@ class TicTacToeHttpServer:
 
     def _end_game_and_record_history(self, game_id, winner_id, reason="completed"):
         game = self.games.get(game_id)
-        if not game:
+        if not game or game["status"] == "finished":
             return
 
         game["status"] = "finished"
@@ -367,65 +437,62 @@ class TicTacToeHttpServer:
             "symbols": dict(game["symbols"]),
             "reason": reason,
         }
-        
-        all_involved_users = game["players"] + game["spectators"]
-        for username in all_involved_users:
-            if username not in self.game_history:
-                self.game_history[username] = []
-            self.game_history[username].append(history_entry)
-            if username in self.users:
-                self.users[username]["game_id"] = None
-                self.users[username]["symbol"] = None
 
+        all_involved_players = game["players"] + game["spectators"]
+        for p_id in all_involved_players:
+            if p_id not in self.game_history:
+                self.game_history[p_id] = []
+            self.game_history[p_id].append(history_entry)
+            if p_id in self.players:
+                self.players[p_id]["game_id"] = None
+                self.players[p_id]["symbol"] = None
 
-    def get_player_history(self, username):
-        if username not in self.users:
-            return {"status": "ERROR", "message": "User not registered."}
+    def get_player_history(self, player_id):
+        if player_id not in self.players:
+            return {"status": "ERROR", "message": "Player not registered."}
 
-        return {"status": "OK", "history": self.game_history.get(username, [])}
+        history_with_symbols = []
+        for entry in self.game_history.get(player_id, []):
+            game_id = entry["game_id"]
+            if game_id in self.games:
+                entry["symbols"] = self.games[game_id].get("symbols", {})
+            history_with_symbols.append(entry)
 
-    def leave_game(self, username):
-        # This is now for explicitly leaving, not just disconnecting
-        if username not in self.users:
-            return {"status": "ERROR", "message": "Invalid username."}
-        
-        game_id = self.users[username].get("game_id")
-        if game_id and game_id in self.games:
+        return {"status": "OK", "history": self.game_history.get(player_id, [])}
+
+    def leave_game(self, player_id):
+        if player_id not in self.players:
+            return {"status": "ERROR", "message": "Invalid player ID."}
+        game_id = self.players[player_id].get("game_id")
+
+        if game_id and self.games.get(game_id):
             game = self.games[game_id]
-            if username in game["players"]:
-                if game["status"] != "finished":
-                    other_player = next((p for p in game["players"] if p != username), None)
+
+            # If player is a spectator
+            if player_id in game["spectators"]:
+                game["spectators"].remove(player_id)
+            # If player is an active player
+            elif player_id in game["players"]:
+                if game["status"] != "finished" and len(game["players"]) > 1:
+                    other_player = next(
+                        (p for p in game["players"] if p != player_id), None
+                    )
                     if other_player:
-                        self._end_game_and_record_history(game_id, other_player, reason="abandon")
-                # If only one player or waiting, just remove the game
-                elif len(game["players"]) == 1:
-                     del self.games[game_id]
+                        self._end_game_and_record_history(
+                            game_id, other_player, reason="disconnect"
+                        )
+                elif game["status"] == "waiting":
+                    # If a waiting game is abandoned, remove it completely
+                    if game_id in self.games:
+                        del self.games[game_id]
 
-            elif username in game["spectators"]:
-                game["spectators"].remove(username)
+        # Reset player's game state
+        if player_id in self.players:
+            self.players[player_id]["game_id"] = None
+            self.players[player_id]["symbol"] = None
 
-        # Reset user's game state
-        self.users[username]["game_id"] = None
-        self.users[username]["symbol"] = None
-        self.users[username]['connected'] = False
-        self.save_users() # Ensure state is saved
+        self.save_game_state()
         return {"status": "OK", "message": "You have left the game."}
-
-    def disconnect_user(self, username):
-        if username in self.users:
-            user = self.users[username]
-            user['connected'] = False
-            user['last_seen'] = datetime.now().isoformat()
-            
-            game_id = user.get('game_id')
-            if game_id and game_id in self.games:
-                game = self.games[game_id]
-                if username in game['players'] and username not in game.get('disconnected_players', []):
-                    game.setdefault('disconnected_players', []).append(username)
-                    if game['status'] == 'playing':
-                        game['status'] = 'disconnected'
-            self.save_users()
-        return {"status": "OK", "message": "User disconnected"}
 
 
 if __name__ == "__main__":
@@ -435,4 +502,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("Server shutting down...")
         server.socket.close()
+        server.save_game_state()
         logging.info("Server closed.")
