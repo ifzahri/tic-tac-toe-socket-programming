@@ -23,8 +23,8 @@ WHITE, BLACK, BLUE, RED, GREEN, GRAY, LIGHT_GRAY, ORANGE = (255, 255, 255), (0, 
 font_large, font_medium, font_small = pygame.font.Font(None, 72), pygame.font.Font(None, 36), pygame.font.Font(None, 24)
 
 class ClientInterface:
-    def __init__(self, player_id):
-        self.player_id = player_id
+    def __init__(self, username):
+        self.username = username
         self.server_address = ('localhost', 55556)
 
     def send_request(self, method, path, body_dict=None):
@@ -61,66 +61,110 @@ class ClientInterface:
             logging.error(f"Request failed: {e}")
             return {"status": "ERROR", "message": str(e)}
 
-    def register_player(self):
-        return self.send_request("POST", f"/player/{self.player_id}")
+    def register(self, username, password):
+        return self.send_request("POST", "/register", {"username": username, "password": password})
+
+    def login(self, username, password):
+        return self.send_request("POST", "/login", {"username": username, "password": password})
 
     def create_game(self):
-        return self.send_request("POST", f"/game/create/{self.player_id}")
+        return self.send_request("POST", f"/game/create/{self.username}")
 
     def join_game(self, game_id):
-        return self.send_request("POST", f"/game/join/{self.player_id}", {"game_id": game_id})
+        return self.send_request("POST", f"/game/join/{self.username}", {"game_id": game_id})
     
     def spectate_game(self, game_id):
-        return self.send_request("POST", f"/game/spectate/{self.player_id}", {"game_id": game_id})
+        return self.send_request("POST", f"/game/spectate/{self.username}", {"game_id": game_id})
 
     def make_move(self, row, col):
-        return self.send_request("POST", f"/move/{self.player_id}", {"row": row, "col": col})
+        return self.send_request("POST", f"/move/{self.username}", {"row": row, "col": col})
 
     def get_game_state(self):
-        return self.send_request("GET", f"/game/state/{self.player_id}")
+        return self.send_request("GET", f"/game/state/{self.username}")
 
     def get_available_games(self):
         return self.send_request("GET", "/games")
 
     def get_history(self):
-        return self.send_request("GET", f"/history/{self.player_id}")
+        return self.send_request("GET", f"/history/{self.username}")
 
     def leave_game(self):
-        return self.send_request("POST", f"/game/leave/{self.player_id}")
+        return self.send_request("POST", f"/game/leave/{self.username}")
+
+    def disconnect(self):
+        return self.send_request("POST", f"/disconnect/{self.username}")
 
 
 class TicTacToeGame:
-    def __init__(self, player_id):
-        self.player_id = player_id
-        self.client = ClientInterface(player_id)
-        self.game_status = 'menu'  # menu, lobby, waiting, playing, spectating, finished
-        self.message = "Welcome to Tic Tac Toe!"
+    def __init__(self):
+        self.username = None
+        self.client = ClientInterface(None) # Temporary client for login/register
+        self.game_status = 'login' # Always start at login
+        self.login_mode = 'login' # or 'register'
+        self.message = "Enter your credentials"
+        
         self.board = [['.' for _ in range(3)] for _ in range(3)]
         self.winner, self.current_turn, self.your_symbol, self.players, self.symbols = None, None, None, [], {}
+        self.disconnected_players = []
         self.available_games, self.lobby_buttons = [], []
         self.game_history = []
+
+        # Input fields
+        self.username_text = ''
+        self.password_text = ''
+        self.active_input = 'username' # 'username' or 'password'
         
         self.board_size = 450
         self.board_start_x = (WIDTH - self.board_size) // 2
         self.board_start_y = 150
         self.cell_size = self.board_size // 3
-        
-        result = self.client.register_player()
-        self.message = result.get('message', 'Registration failed.')
 
     def draw_text(self, text, font, color, center_pos):
         render = font.render(text, True, color)
         rect = render.get_rect(center=center_pos)
         screen.blit(render, rect)
 
+    def draw_login_screen(self):
+        screen.fill(WHITE)
+        title = "Login" if self.login_mode == 'login' else "Register"
+        self.draw_text(title, font_large, BLACK, (WIDTH//2, 80))
+
+        # Username field
+        self.draw_text("Username", font_small, BLACK, (WIDTH//2, 150))
+        username_rect = pygame.Rect(WIDTH//2 - 150, 170, 300, 40)
+        pygame.draw.rect(screen, LIGHT_GRAY, username_rect)
+        pygame.draw.rect(screen, BLACK if self.active_input == 'username' else GRAY, username_rect, 2)
+        self.draw_text(self.username_text, font_medium, BLACK, username_rect.center)
+
+        # Password field
+        self.draw_text("Password", font_small, BLACK, (WIDTH//2, 230))
+        password_rect = pygame.Rect(WIDTH//2 - 150, 250, 300, 40)
+        pygame.draw.rect(screen, LIGHT_GRAY, password_rect)
+        pygame.draw.rect(screen, BLACK if self.active_input == 'password' else GRAY, password_rect, 2)
+        self.draw_text('*' * len(self.password_text), font_medium, BLACK, password_rect.center)
+
+        # Buttons
+        action_button = pygame.Rect(WIDTH//2 - 100, 320, 200, 50)
+        pygame.draw.rect(screen, GREEN, action_button)
+        self.draw_text(title, font_medium, WHITE, action_button.center)
+
+        switch_mode_button = pygame.Rect(WIDTH//2 - 150, 390, 300, 40)
+        switch_text = "Don't have an account? Register" if self.login_mode == 'login' else "Already have an account? Login"
+        self.draw_text(switch_text, font_small, BLUE, switch_mode_button.center)
+        
+        self.draw_text(self.message, font_small, RED, (WIDTH//2, 450))
+
+        return username_rect, password_rect, action_button, switch_mode_button
+
     def draw_menu(self):
         screen.fill(WHITE)
         self.draw_text("Tic Tac Toe", font_large, BLACK, (WIDTH//2, 50))
-        self.draw_text(f"Player: {self.player_id}", font_medium, BLUE, (WIDTH//2, 120))
+        self.draw_text(f"Player: {self.username}", font_medium, BLUE, (WIDTH//2, 120))
         
-        create_button = pygame.Rect(WIDTH//2 - 100, 200, 200, 50)
-        join_button = pygame.Rect(WIDTH//2 - 100, 270, 200, 50)
-        history_btn = pygame.Rect(WIDTH//2 - 125, 340, 250, 50)
+        y_start = 200
+        create_button = pygame.Rect(WIDTH//2 - 100, y_start, 200, 50)
+        join_button = pygame.Rect(WIDTH//2 - 100, y_start + 70, 200, 50)
+        history_btn = pygame.Rect(WIDTH//2 - 125, y_start + 140, 250, 50)
         
         pygame.draw.rect(screen, GREEN, create_button)
         pygame.draw.rect(screen, BLUE, join_button)
@@ -129,7 +173,7 @@ class TicTacToeGame:
         self.draw_text("Create Game", font_medium, WHITE, create_button.center)
         self.draw_text("Game Lobby", font_medium, WHITE, join_button.center)
         self.draw_text("Game History", font_medium, WHITE, history_btn.center)
-        self.draw_text(self.message, font_small, BLACK, (WIDTH//2, 420))
+        self.draw_text(self.message, font_small, BLACK, (WIDTH//2, y_start + 210))
         
         return create_button, join_button, history_btn
 
@@ -184,15 +228,14 @@ class TicTacToeGame:
         else:
             for entry in self.game_history[-10:]: # Show last 10 games
                 winner = entry.get('winner')
-                player_symbol = entry.get('symbols', {}).get(self.player_id)
                 
-                outcome = "Victory" if winner == self.player_id else "Defeat" if winner not in ['draw', None] else "Draw"
+                outcome = "Victory" if winner == self.username else "Defeat" if winner not in ['draw', None] else "Draw"
                 color = GREEN if outcome == "Victory" else RED if outcome == "Defeat" else BLACK
                 
                 try: date = datetime.datetime.fromisoformat(entry['date']).strftime('%Y-%m-%d %H:%M')
                 except (ValueError, TypeError): date = "Unknown Date"
                     
-                other_players = ', '.join(p for p in entry['players'] if p != self.player_id)
+                other_players = ', '.join(p for p in entry['players'] if p != self.username)
                 if not other_players: other_players = "Yourself" 
                 text = f"{date} - Vs {other_players} - {outcome}"
                 
@@ -216,11 +259,13 @@ class TicTacToeGame:
             self.draw_text(f"You are: {self.your_symbol}", font_small, BLUE, (80, 70))
 
         if self.game_status == 'playing' and self.current_turn:
-            turn_msg = "YOUR TURN!" if self.current_turn == self.player_id else f"Turn: {self.current_turn}"
-            color = GREEN if self.current_turn == self.player_id else BLACK
+            turn_msg = "YOUR TURN!" if self.current_turn == self.username else f"Turn: {self.current_turn}"
+            color = GREEN if self.current_turn == self.username else BLACK
             self.draw_text(turn_msg, font_medium, color, (WIDTH//2, 100))
         elif self.game_status == 'spectating' and self.current_turn:
              self.draw_text(f"Turn: {self.current_turn}", font_medium, BLACK, (WIDTH//2, 100))
+        elif self.game_status == 'disconnected':
+            self.draw_text("A player has disconnected.", font_medium, RED, (WIDTH//2, 100))
 
         for i in range(4):
             pygame.draw.line(screen, BLACK, (self.board_start_x + i * self.cell_size, self.board_start_y), (self.board_start_x + i * self.cell_size, self.board_start_y + self.board_size), 3)
@@ -237,12 +282,27 @@ class TicTacToeGame:
         
         status_y = self.board_start_y + self.board_size + 40
         status_msg = ""
-        if self.game_status == 'waiting': status_msg = "Waiting for another player..."
+        if self.game_status == 'waiting':
+            status_msg = "Waiting for another player..."
+        elif self.game_status == 'disconnected':
+            disconnected_list = ", ".join(self.disconnected_players)
+            status_msg = f"Waiting for {disconnected_list} to reconnect..."
         elif self.game_status == 'finished':
             winner_id = self.winner
-            if winner_id == 'draw': status_msg = "Game ended in a draw!"
-            elif winner_id == self.player_id: status_msg = "You won!"
-            else: status_msg = f"Player '{winner_id}' won!"
+            if winner_id == 'draw':
+                status_msg = "Game ended in a draw!"
+            elif winner_id == self.username:
+                status_msg = "You won! :)"
+            elif winner_id:
+                status_msg = "You lose! :("
+            else: # Should not happen, but as a fallback
+                status_msg = "Game Over"
+        
+        # Default message if status is 'playing' or something else
+        if not status_msg and self.game_status == 'playing':
+            # This space is intentionally left blank as the turn indicator is shown above the board
+            pass
+        
         self.draw_text(status_msg, font_medium, BLACK, (WIDTH//2, status_y))
 
         if self.game_status == 'finished':
@@ -253,7 +313,7 @@ class TicTacToeGame:
         return None
 
     def handle_click(self, pos):
-        if self.game_status == 'playing' and self.current_turn == self.player_id:
+        if self.game_status == 'playing' and self.current_turn == self.username:
             if self.board_start_x <= pos[0] <= self.board_start_x + self.board_size and \
                self.board_start_y <= pos[1] <= self.board_start_y + self.board_size:
                 col = (pos[0] - self.board_start_x) // self.cell_size
@@ -272,6 +332,7 @@ class TicTacToeGame:
         self.current_turn = state.get('current_turn', self.current_turn)
         self.winner = state.get('winner', self.winner)
         self.your_symbol = state.get('your_symbol', self.your_symbol)
+        self.disconnected_players = state.get('disconnected_players', [])
 
     def action_create_game(self):
         result = self.client.create_game()
@@ -314,17 +375,25 @@ class TicTacToeGame:
             self.message = result.get('message', "Could not fetch game history.")
 
     def update_game_state(self):
-        if self.game_status not in ['waiting', 'playing', 'spectating']:
+        if self.game_status not in ['waiting', 'playing', 'spectating', 'disconnected']:
             return
         result = self.client.get_game_state()
         if result.get('status') == 'OK':
             self.update_from_state(result.get('game_state', {}))
-        elif result.get("message") == "Player not in a game":
+        elif "not in a game" in result.get("message", ""):
+            self.message = "The game has ended."
+            self.back_to_menu(notify_server=False)
+        elif result.get('status') == 'ERROR':
+            # Handle server connection loss
+            self.game_status = 'disconnected'
+            self.message = "Connection lost. Attempting to reconnect..."
+            # In a real app, you might have a more robust reconnection loop here
+            # For now, we just show a message and the user can use the "Continue" button
             self.back_to_menu(notify_server=False)
 
 
     def back_to_menu(self, notify_server=True):
-        if notify_server and self.game_status in ['waiting', 'playing', 'spectating', 'finished']:
+        if notify_server and self.game_status in ['waiting', 'playing', 'spectating', 'finished', 'disconnected']:
             result = self.client.leave_game()
             self.message = result.get('message', "Welcome back!")
         else:
@@ -333,22 +402,50 @@ class TicTacToeGame:
         self.game_status = 'menu'
         self.board = [['.' for _ in range(3)] for _ in range(3)]
         self.winner, self.current_turn, self.your_symbol = None, None, None
-        self.players, self.symbols = [], {}
+        self.players, self.symbols, self.disconnected_players = [], {}, []
 
 
     def run(self):
         running = True
         update_counter = 0
 
+        # Button rects
         create_btn, lobby_btn, history_btn = None, None, None
         back_from_lobby_btn, back_from_game_btn, back_from_history_btn = None, None, None
+        username_rect, password_rect, action_btn, switch_mode_btn = None, None, None, None
 
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
                 
-                if event.type == pygame.MOUSEBUTTONDOWN:
+                if self.game_status == 'login':
+                    if event.type == pygame.MOUSEBUTTONDOWN:
+                        if username_rect and username_rect.collidepoint(event.pos):
+                            self.active_input = 'username'
+                        elif password_rect and password_rect.collidepoint(event.pos):
+                            self.active_input = 'password'
+                        elif action_btn and action_btn.collidepoint(event.pos):
+                            self.handle_login_register()
+                        elif switch_mode_btn and switch_mode_btn.collidepoint(event.pos):
+                            self.login_mode = 'register' if self.login_mode == 'login' else 'login'
+                            self.message = "Enter your credentials"
+                    
+                    if event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_RETURN:
+                            self.handle_login_register()
+                        elif event.key == pygame.K_BACKSPACE:
+                            if self.active_input == 'username':
+                                self.username_text = self.username_text[:-1]
+                            else:
+                                self.password_text = self.password_text[:-1]
+                        else:
+                            if self.active_input == 'username':
+                                self.username_text += event.unicode
+                            else:
+                                self.password_text += event.unicode
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:
                     if self.game_status == 'menu':
                         if create_btn and create_btn.collidepoint(event.pos): self.action_create_game()
                         elif lobby_btn and lobby_btn.collidepoint(event.pos): self.action_fetch_games()
@@ -371,11 +468,13 @@ class TicTacToeGame:
                         self.handle_click(event.pos)
 
             update_counter += 1
-            if update_counter > (FPS * 1.5): # Poll every ~1.5 seconds
+            if update_counter > (FPS * 1.5) and self.client and self.username:
                 self.update_game_state()
                 update_counter = 0
 
-            if self.game_status == 'menu':
+            if self.game_status == 'login':
+                username_rect, password_rect, action_btn, switch_mode_btn = self.draw_login_screen()
+            elif self.game_status == 'menu':
                 create_btn, lobby_btn, history_btn = self.draw_menu()
             elif self.game_status == 'lobby':
                 back_from_lobby_btn = self.draw_lobby_menu()
@@ -388,19 +487,36 @@ class TicTacToeGame:
             clock.tick(FPS)
             
         # Notify server on window close if in an active game/session
-        if self.game_status != 'menu':
-            self.client.leave_game()
+        if self.client and self.game_status != 'menu':
+            self.client.disconnect()
             
         pygame.quit()
         sys.exit()
 
-if __name__ == "__main__":
-    player_id_input = input("Enter your player ID (or press Enter for a random one): ")
-    if not player_id_input:
-        player_id = f"player_{uuid.uuid4().hex[:6]}"
-        print(f"No ID entered, using generated ID: {player_id}")
-    else:
-        player_id = player_id_input
+    def handle_login_register(self):
+        if not self.username_text or not self.password_text:
+            self.message = "Username and password cannot be empty."
+            return
 
-    game = TicTacToeGame(player_id)
+        if self.login_mode == 'login':
+            result = self.client.login(self.username_text, self.password_text)
+            if result.get('status') == 'OK':
+                self.username = self.username_text
+                self.client.username = self.username # Update client's username
+                self.message = result.get('message')
+                if result.get('game_state'):
+                    self.update_from_state(result['game_state'])
+                else:
+                    self.game_status = 'menu'
+            else:
+                self.message = result.get('message', 'Login failed.')
+        
+        else: # register
+            result = self.client.register(self.username_text, self.password_text)
+            self.message = result.get('message', 'Registration failed.')
+            if result.get('status') == 'OK':
+                self.login_mode = 'login' # Switch to login after successful registration
+
+if __name__ == "__main__":
+    game = TicTacToeGame()
     game.run()
