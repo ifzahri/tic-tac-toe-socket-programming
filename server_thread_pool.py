@@ -2,12 +2,15 @@ import socket
 import threading
 import logging
 import time
+import argparse
+import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 # Impor kelas HttpServer dari file http.py
 from http import HttpServer
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 class ThreadPoolHTTPServer:
@@ -76,14 +79,14 @@ class ThreadPoolHTTPServer:
 
         except socket.timeout:
             logging.warning("Client request timed out")
-            response = self.http_server.create_response(
+            response = self.http_server.response(
                 408,
                 "Request Timeout",
                 {"status": "ERROR", "message": "Request timeout"},
             )
         except Exception as e:
             logging.error(f"Error handling request: {e}")
-            response = self.http_server.create_response(
+            response = self.http_server.response(
                 500, "Internal Server Error", {"status": "ERROR", "message": str(e)}
             )
         finally:
@@ -133,11 +136,111 @@ class ThreadPoolHTTPServer:
         logging.info("Server shutdown complete.")
 
 
-if __name__ == "__main__":
-    server = ThreadPoolHTTPServer()
+def get_server_config():
+    """Get server configuration from command line arguments and environment variables"""
+    parser = argparse.ArgumentParser(description='TicTacToe HTTP Server with Thread Pool')
+    
+    # Command line arguments
+    parser.add_argument('--host', '-H', 
+                       default=os.getenv('TICTACTOE_HOST', 'localhost'),
+                       help='Server host address (default: localhost, env: TICTACTOE_HOST)')
+    
+    parser.add_argument('--port', '-p', 
+                       type=int,
+                       default=int(os.getenv('TICTACTOE_PORT', '55556')),
+                       help='Server port number (default: 55556, env: TICTACTOE_PORT)')
+    
+    parser.add_argument('--workers', '-w',
+                       type=int, 
+                       default=int(os.getenv('TICTACTOE_WORKERS', '10')),
+                       help='Maximum number of worker threads (default: 10, env: TICTACTOE_WORKERS)')
+    
+    parser.add_argument('--log-level', '-l',
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                       default=os.getenv('TICTACTOE_LOG_LEVEL', 'INFO'),
+                       help='Logging level (default: INFO, env: TICTACTOE_LOG_LEVEL)')
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Validate port range
+    if not (1 <= args.port <= 65535):
+        print(f"Error: Port {args.port} is not valid. Must be between 1 and 65535.")
+        sys.exit(1)
+    
+    # Validate workers
+    if args.workers < 1:
+        print(f"Error: Workers {args.workers} is not valid. Must be at least 1.")
+        sys.exit(1)
+    
+    # Set logging level
+    numeric_level = getattr(logging, args.log_level)
+    logging.getLogger().setLevel(numeric_level)
+    
+    return args
+
+
+def check_port_availability(host, port):
+    """Check if the specified port is available for binding"""
     try:
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        test_socket.bind((host, port))
+        test_socket.close()
+        return True
+    except socket.error as e:
+        logging.error(f"Port {port} is not available: {e}")
+        return False
+
+
+def find_available_port(host, start_port, max_attempts=10):
+    """Find an available port starting from start_port"""
+    for port in range(start_port, start_port + max_attempts):
+        if check_port_availability(host, port):
+            logging.info(f"Found available port: {port}")
+            return port
+    return None
+
+
+def main():
+    """Main function with dynamic configuration support"""
+    try:
+        # Get configuration
+        config = get_server_config()
+        
+        logging.info(f"Starting TicTacToe Server with configuration:")
+        logging.info(f"  Host: {config.host}")
+        logging.info(f"  Port: {config.port}")
+        logging.info(f"  Workers: {config.workers}")
+        logging.info(f"  Log Level: {config.log_level}")
+        
+        # Check if port is available
+        if not check_port_availability(config.host, config.port):
+            logging.warning(f"Port {config.port} is not available, searching for alternative...")
+            alternative_port = find_available_port(config.host, config.port + 1)
+            
+            if alternative_port:
+                logging.info(f"Using alternative port: {alternative_port}")
+                config.port = alternative_port
+            else:
+                logging.error("No available ports found")
+                sys.exit(1)
+        
+        # Create and start server
+        server = ThreadPoolHTTPServer(
+            host=config.host,
+            port=config.port,
+            max_workers=config.workers
+        )
+        
         server.start_server()
+        
     except KeyboardInterrupt:
         logging.info("Received interrupt signal...")
-    finally:
-        server.shutdown()
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
