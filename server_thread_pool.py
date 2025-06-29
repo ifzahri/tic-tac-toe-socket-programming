@@ -6,12 +6,9 @@ import argparse
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
-
-# Impor kelas HttpServer dari file http.py
 from http import HttpServer
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s')
 
 class ThreadPoolHTTPServer:
     def __init__(self, host="localhost", port=55556, max_workers=10):
@@ -20,12 +17,9 @@ class ThreadPoolHTTPServer:
         self.max_workers = max_workers
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
         self.http_server = HttpServer()
-
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='Worker')
         self.running = False
-
         self.lock = threading.Lock()
 
     def start_server(self):
@@ -33,106 +27,62 @@ class ThreadPoolHTTPServer:
             self.socket.bind((self.host, self.port))
             self.socket.listen(5)
             self.running = True
-            logging.info(
-                f"Tic Tac Toe HTTP Server started on {self.host}:{self.port} with {self.max_workers} workers"
-            )
-
-            # Memulai thread untuk memeriksa pemain yang tidak aktif
-            reaper_thread = threading.Thread(target=self.reap_inactive_players)
-            reaper_thread.daemon = True
-            reaper_thread.start()
-
+            logging.info(f"Server starting on {self.host}:{self.port} with {self.max_workers} workers")
             while self.running:
                 try:
                     client_socket, address = self.socket.accept()
-                    logging.info(f"Connection from {address}")
-
-                    # Menangani request di thread pool
-                    self.executor.submit(self.handle_request, client_socket)
-
-                except socket.error as e:
-                    if self.running:
-                        logging.error(f"Socket error: {e}")
+                    logging.info(f"Accepted connection from {address}")
+                    self.executor.submit(self.handle_request, client_socket, address)
+                except OSError:
+                    if self.running: logging.error("Socket error on accept()")
                     break
-                except Exception as e:
-                    logging.error(f"Error accepting connection: {e}")
-                    break
-
         except Exception as e:
-            logging.error(f"Error starting server: {e}")
+            logging.error(f"Failed to start server: {e}")
         finally:
             self.shutdown()
 
-    def handle_request(self, client_socket):
-        """Menangani request dari satu klien"""
+    def handle_request(self, client_socket, address):
+        logging.info(f"Handler started for {address}")
         response = None
         try:
-            client_socket.settimeout(30)
+            client_socket.settimeout(10)
             request_data = client_socket.recv(4096).decode("utf-8")
+
             if not request_data:
+                logging.warning(f"No data received from {address}. Closing connection.")
                 return
 
-            # Menggunakan lock untuk memproses request secara thread-safe
+            logging.info(f"Received {len(request_data)} bytes from {address}")
+
             with self.lock:
-                # Memanggil metode 'proses' dari HttpServer
+                logging.info(f"Acquired lock for processing request from {address}")
                 response = self.http_server.proses(request_data)
+                logging.info(f"Releasing lock for {address}")
 
         except socket.timeout:
-            logging.warning("Client request timed out")
-            response = self.http_server.response(
-                408,
-                "Request Timeout",
-                {"status": "ERROR", "message": "Request timeout"},
-            )
+            logging.warning(f"Request from {address} timed out.")
+            response = self.http_server.response(408, "Request Timeout", {"status": "ERROR", "message": "Request timeout"})
+        except ConnectionResetError:
+            logging.warning(f"Connection reset by {address} during recv.")
         except Exception as e:
-            logging.error(f"Error handling request: {e}")
-            response = self.http_server.response(
-                500, "Internal Server Error", {"status": "ERROR", "message": str(e)}
-            )
+            logging.error(f"Error handling request from {address}: {e}", exc_info=True)
+            response = self.http_server.response(500, "Internal Server Error", {"status": "ERROR", "message": str(e)})
         finally:
             if response:
                 try:
-                    # Mengirim response yang sudah lengkap (termasuk header)
                     client_socket.sendall(response)
+                    logging.info(f"Response sent to {address}")
                 except Exception as e:
-                    logging.error(f"Error sending response: {e}")
+                    logging.error(f"Error sending response to {address}: {e}")
+
+            logging.info(f"Closing connection for {address}")
             client_socket.close()
 
-    def reap_inactive_players(self):
-        """Background thread untuk memeriksa pemain yang tidak aktif"""
-        while self.running:
-            try:
-                time.sleep(5)
-                with self.lock:
-                    # Memanggil fungsi check_inactive_players dari game_logic melalui http_server
-                    self.http_server.logic.check_inactive_players()
-            except Exception as e:
-                logging.error(f"Error in reaper thread: {e}")
-
     def shutdown(self):
-        if not self.running:
-            return
-
         logging.info("Shutting down server...")
         self.running = False
-
-        try:
-            with self.lock:
-                self.http_server.logic.save_game_state()
-        except Exception as e:
-            logging.error(f"Error saving game state during shutdown: {e}")
-
         self.executor.shutdown(wait=True)
-        
-        try:
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(
-                (self.host, self.port)
-            )
-        except:
-            pass
-        finally:
-            self.socket.close()
-
+        self.socket.close()
         logging.info("Server shutdown complete.")
 
 
@@ -160,20 +110,16 @@ def get_server_config():
                        default=os.getenv('TICTACTOE_LOG_LEVEL', 'INFO'),
                        help='Logging level (default: INFO, env: TICTACTOE_LOG_LEVEL)')
     
-    # Parse arguments
     args = parser.parse_args()
     
-    # Validate port range
     if not (1 <= args.port <= 65535):
         print(f"Error: Port {args.port} is not valid. Must be between 1 and 65535.")
         sys.exit(1)
     
-    # Validate workers
     if args.workers < 1:
         print(f"Error: Workers {args.workers} is not valid. Must be at least 1.")
         sys.exit(1)
     
-    # Set logging level
     numeric_level = getattr(logging, args.log_level)
     logging.getLogger().setLevel(numeric_level)
     
@@ -205,7 +151,6 @@ def find_available_port(host, start_port, max_attempts=10):
 def main():
     """Main function with dynamic configuration support"""
     try:
-        # Get configuration
         config = get_server_config()
         
         logging.info(f"Starting TicTacToe Server with configuration:")
@@ -214,7 +159,6 @@ def main():
         logging.info(f"  Workers: {config.workers}")
         logging.info(f"  Log Level: {config.log_level}")
         
-        # Check if port is available
         if not check_port_availability(config.host, config.port):
             logging.warning(f"Port {config.port} is not available, searching for alternative...")
             alternative_port = find_available_port(config.host, config.port + 1)
@@ -226,7 +170,6 @@ def main():
                 logging.error("No available ports found")
                 sys.exit(1)
         
-        # Create and start server
         server = ThreadPoolHTTPServer(
             host=config.host,
             port=config.port,
