@@ -9,7 +9,7 @@ import time
 
 logging.basicConfig(level=logging.INFO)
 
-# Initialize Pygame
+
 pygame.init()
 
 WIDTH, HEIGHT = 600, 700
@@ -41,7 +41,8 @@ font_large, font_medium, font_small = (
 class ClientInterface:
     def __init__(self, player_id):
         self.player_id = player_id
-        self.server_address = ("localhost", 55556)
+        self.server_address = ("localhost", 44444)
+        # self.server_address = ("localhost", 55556)
 
     def send_request(self, method, path, body_dict=None, max_retries=3, delay=2):
         for attempt in range(max_retries):
@@ -157,7 +158,6 @@ class TicTacToeGame:
         self.is_disconnected = False
         self.reconnect_attempt_timer = 0
         
-        # State to check for a resumable game
         self.resumable_game_status = None
 
         self.board_size = 450
@@ -176,7 +176,6 @@ class TicTacToeGame:
         else:
             self.is_disconnected = False
             self.message = result.get("message", "Registration failed.")
-            # On initial connection, check if a game can be resumed
             self.update_game_state(check_for_resume=True)
 
     def handle_server_response(self, result):
@@ -484,8 +483,6 @@ class TicTacToeGame:
             pygame.display.flip()
             clock.tick(FPS)
 
-        # Closing the window no longer forfeits the game.
-        # It is treated as an involuntary disconnect.
         pygame.quit()
         sys.exit()
 
