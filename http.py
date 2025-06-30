@@ -29,14 +29,15 @@ class HttpServer:
             method, path, _ = request_line.split(" ")
         except ValueError:
             return None, None, None
-        
+
         body = ""
         if '\r\n\r\n' in request_data:
             body = request_data.split('\r\n\r\n', 1)[1]
-        
+
         return method, path, body
 
     def proses(self, request_data):
+        self.logic.load_game_state()
         method, path, body = self.parse_request(request_data)
 
         if method is None:
@@ -50,10 +51,10 @@ class HttpServer:
             potential_id = parts[-1]
             if potential_id in self.logic.players:
                 player_id_from_path = potential_id
-        
+
         if player_id_from_path:
             self.logic.update_player_last_seen(player_id_from_path)
-        
+
         response_body = None
         try:
             if method == "POST" and path.startswith("/player/"):
@@ -85,9 +86,9 @@ class HttpServer:
             elif method == "POST" and path.startswith("/game/leave/"):
                 player_id = path.split("/")[-1]
                 response_body = self.logic.leave_game(player_id)
-        
+
         except (json.JSONDecodeError, KeyError) as e:
-             return self.response(400, "Bad Request", {"status": "ERROR", "message": f"Invalid JSON or missing key: {e}"})
+            return self.response(400, "Bad Request", {"status": "ERROR", "message": f"Invalid JSON or missing key: {e}"})
 
         if response_body:
             return self.response(200, "OK", response_body)
